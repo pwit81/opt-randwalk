@@ -108,22 +108,39 @@ void *malloc_page_aligned(size_t size) {
 #include <papi.h>
 
 /*
- * Based on /usr/share/papi/5.7/papi_events.csv
+ * We use generic perf events (perf::) wherever possible for cross-platform
+ * compatibility (Intel & AMD). For events without generic equivalents (L2
+ * cache misses), we try multiple alternatives at init time.
  *
- * PAPI_TOT_INS: total instructions
- * PAPI_TOT_CYC: total cycles
- * PAPI_BR_CN: conditional branch instructions
- * PAPI_BR_MSP: mispredicted branches
- * PAPI_LD_INS: retired load instructions
- * PAPI_SR_INS: retired store instructions
- * PAPI_L1_DCM: L1 Data Cache misses
- * PAPI_L2_DCA: L2 Data Cache accesses
- * PAPI_L2_DCM: L2 Data Cache misses
- * PAPI_TLB_DM: data TLB misses
+ * Generic (work on all x86 with Linux perf):
+ *   perf::INSTRUCTIONS          -> total instructions
+ *   perf::CYCLES                -> total cycles
+ *   perf::BRANCH-INSTRUCTIONS   -> branch instructions
+ *   perf::BRANCH-MISSES         -> mispredicted branches
+ *   perf::L1-DCACHE-LOADS       -> load instructions (denominator)
+ *   perf::L1-DCACHE-STORES      -> store instructions (denominator)
+ *   perf::L1-DCACHE-LOAD-MISSES -> L1 Data Cache misses
+ *   perf::LLC-LOAD-MISSES       -> Last-Level Cache misses
+ *   perf::DTLB-LOAD-MISSES      -> data TLB misses
+ *
+ * Non-generic (L2 cache misses — no perf:: equivalent):
+ *   Tried in order: PAPI_L2_DCM (preset),
+ *                   L2_RQSTS:DEMAND_DATA_RD_MISS (Intel native),
+ *                   REQUESTS_TO_L2_GROUP:L2_HW_PF (AMD native, approximate)
+ *   The first one that succeeds is used; the actual name is stored in
+ *   the evset so that pmc_read() can find it.
  */
 
 #define MAX_EVENT 10
 #define MIN_HWCTRS 4
+
+/* Sentinel names for events resolved via fallback at init time. */
+#define L1_LOADS_PLACEHOLDER  "<<L1_LD>>"
+#define L1_STORES_PLACEHOLDER "<<L1_SR>>"
+#define L1_DCM_PLACEHOLDER    "<<L1_DCM>>"
+#define L2_DCM_PLACEHOLDER    "<<L2_DCM>>"
+#define L3_TCM_PLACEHOLDER    "<<L3_TCM>>"
+#define DTLB_DM_PLACEHOLDER   "<<DTLB_DM>>"
 
 static int eventset = PAPI_NULL;
 static long long eventcount[MAX_EVENT];
@@ -138,52 +155,50 @@ static evset_t empty_evset[] = {
 };
 
 static evset_t ipc_evset[] = {
-  { "PAPI_TOT_INS", -1 },
-  { "PAPI_TOT_CYC", -1 },
+  { "perf::INSTRUCTIONS", -1 },
+  { "perf::CYCLES", -1 },
   { NULL, - 1 }
 };
 
 static evset_t branch_evset[] = {
-  { "PAPI_BR_CN", -1 },
-  { "PAPI_BR_MSP", -1 },
+  { "perf::BRANCH-INSTRUCTIONS", -1 },
+  { "perf::BRANCH-MISSES", -1 },
   { NULL, -1 }
 };
 
 static evset_t memory_evset[] = {
-  { "PAPI_LD_INS", -1 },
-  { "PAPI_SR_INS", -1 },
-  { "PAPI_L1_DCM", -1 },
-  { "PAPI_L2_DCM", -1 },
-  { "PAPI_L3_TCM", -1 },
-  { "PAPI_TLB_DM", -1 },
+  { L1_LOADS_PLACEHOLDER, -1 },
+  { L1_STORES_PLACEHOLDER, -1 },
+  { L1_DCM_PLACEHOLDER, -1 },
+  { L2_DCM_PLACEHOLDER, -1 },
   { NULL, -1 },
 };
 
 static evset_t l1cache_evset[] = {
-  { "PAPI_LD_INS", -1 },
-  { "PAPI_SR_INS", -1 },
-  { "PAPI_L1_DCM", -1 },
+  { L1_LOADS_PLACEHOLDER, -1 },
+  { L1_STORES_PLACEHOLDER, -1 },
+  { L1_DCM_PLACEHOLDER, -1 },
   { NULL, -1 },
 };
 
 static evset_t l2cache_evset[] = {
-  { "PAPI_LD_INS", -1 },
-  { "PAPI_SR_INS", -1 },
-  { "PAPI_L2_DCM", -1 },
+  { L1_LOADS_PLACEHOLDER, -1 },
+  { L1_STORES_PLACEHOLDER, -1 },
+  { L2_DCM_PLACEHOLDER, -1 },
   { NULL, -1 },
 };
 
 static evset_t l3cache_evset[] = {
-  { "PAPI_LD_INS", -1 },
-  { "PAPI_SR_INS", -1 },
-  { "PAPI_L3_TCM", -1 },
+  { L1_LOADS_PLACEHOLDER, -1 },
+  { L1_STORES_PLACEHOLDER, -1 },
+  { L3_TCM_PLACEHOLDER, -1 },
   { NULL, -1 },
 };
 
 static evset_t tlb_evset[] = {
-  { "PAPI_LD_INS", -1 },
-  { "PAPI_SR_INS", -1 },
-  { "PAPI_TLB_DM", -1 },
+  { L1_LOADS_PLACEHOLDER, -1 },
+  { L1_STORES_PLACEHOLDER, -1 },
+  { DTLB_DM_PLACEHOLDER, -1 },
   { NULL, -1 },
 };
 
@@ -193,6 +208,23 @@ static evset_t *all_evset[] = {
 };
 
 static evset_t *cur_evset = NULL;
+
+/*
+ * Try to add one of several alternative event names. The first one that
+ * succeeds is stored in es->name so that pmc_read() can find it later.
+ * Returns PAPI_OK on success, or the last error code on failure.
+ */
+static int pmc_try_add(evset_t *es, const char **alternatives, int nalts) {
+  int retval = PAPI_ENOEVNT;
+  for (int i = 0; i < nalts; i++) {
+    retval = PAPI_add_named_event(eventset, alternatives[i]);
+    if (retval == PAPI_OK) {
+      es->name = alternatives[i];
+      return PAPI_OK;
+    }
+  }
+  return retval;
+}
 #endif
 
 pmc_evset_t pmc_evset_by_name(const char *name) {
@@ -245,16 +277,55 @@ void pmc_init(pmc_evset_t evset) {
 	if (retval != PAPI_OK)
 		die("PAPI_create_eventset failed: %s!\n", PAPI_strerror(retval));
 
+  /* Fallback alternatives for various metrics to maximize compatibility.
+   * Order: generic perf:: -> PAPI preset -> Intel native -> AMD native */
+  static const char *alts_loads[] = {
+    "perf::L1-DCACHE-LOADS", "PAPI_LD_INS", "MEM_INST_RETIRED:ALL_LOADS", "LS_DISPATCH:LOAD_DISPATCH", "PAPI_L1_DCA"
+  };
+  static const char *alts_stores[] = {
+    "perf::L1-DCACHE-STORES", "PAPI_SR_INS", "MEM_INST_RETIRED:ALL_STORES", "LS_DISPATCH:STORE_DISPATCH"
+  };
+  static const char *alts_l1_dcm[] = {
+    "perf::L1-DCACHE-LOAD-MISSES", "PAPI_L1_DCM"
+  };
+  static const char *alts_l2_dcm[] = {
+    "PAPI_L2_DCM", "L2_RQSTS:DEMAND_DATA_RD_MISS", "REQUESTS_TO_L2_GROUP:L2_HW_PF"
+  };
+  static const char *alts_l3_tcm[] = {
+    "perf::LLC-LOAD-MISSES", "PAPI_L3_TCM", "ix86arch::LLC_MISSES"
+  };
+  static const char *alts_dtlb[] = {
+    "perf::DTLB-LOAD-MISSES", "PAPI_TLB_DM"
+  };
+
   cur_evset = all_evset[evset];
 
   int idx = 0;
   for (evset_t *es = cur_evset; es->name; es++) {
-    retval = PAPI_add_named_event(eventset, es->name);
-    if (retval != PAPI_OK)
-      die("PAPI_add_named_event %s: %s\n"
-          "Report output from 'papi_component_avail' command!\n",
-          es->name, PAPI_strerror(retval));
-    es->idx = idx++;
+    const char *orig_name = es->name;
+    
+    if (strcmp(es->name, L1_LOADS_PLACEHOLDER) == 0) {
+      retval = pmc_try_add(es, alts_loads, sizeof(alts_loads)/sizeof(alts_loads[0]));
+    } else if (strcmp(es->name, L1_STORES_PLACEHOLDER) == 0) {
+      retval = pmc_try_add(es, alts_stores, sizeof(alts_stores)/sizeof(alts_stores[0]));
+    } else if (strcmp(es->name, L1_DCM_PLACEHOLDER) == 0) {
+      retval = pmc_try_add(es, alts_l1_dcm, sizeof(alts_l1_dcm)/sizeof(alts_l1_dcm[0]));
+    } else if (strcmp(es->name, L2_DCM_PLACEHOLDER) == 0) {
+      retval = pmc_try_add(es, alts_l2_dcm, sizeof(alts_l2_dcm)/sizeof(alts_l2_dcm[0]));
+    } else if (strcmp(es->name, L3_TCM_PLACEHOLDER) == 0) {
+      retval = pmc_try_add(es, alts_l3_tcm, sizeof(alts_l3_tcm)/sizeof(alts_l3_tcm[0]));
+    } else if (strcmp(es->name, DTLB_DM_PLACEHOLDER) == 0) {
+      retval = pmc_try_add(es, alts_dtlb, sizeof(alts_dtlb)/sizeof(alts_dtlb[0]));
+    } else {
+      retval = PAPI_add_named_event(eventset, es->name);
+    }
+    
+    if (retval != PAPI_OK) {
+      fprintf(stderr, "Warning: Failed to add event for %s: %s\n", orig_name, PAPI_strerror(retval));
+      es->name = NULL; // Mark as failed
+    } else {
+      es->idx = idx++;
+    }
   }
 
   pmc_clear();
@@ -294,11 +365,11 @@ void pmc_clear(void) {
 #endif
 }
 
-static long long pmc_read(const char *name) {
+static long long pmc_read_by_index(int idx) {
 #if PAPI
-  for (evset_t *es = cur_evset; es->name; es++)
-    if (strcmp(es->name, name) == 0)
-      return eventcount[es->idx];
+  if (idx >= 0 && idx < MAX_EVENT && cur_evset[idx].name != NULL) {
+    return eventcount[cur_evset[idx].idx];
+  }
 #endif
   return 0;
 }
@@ -306,27 +377,53 @@ static long long pmc_read(const char *name) {
 void pmc_print(void) {
 #if PAPI
   if (cur_evset == ipc_evset) {
-    printf("> Total instructions: %ld\n", (long)pmc_read("PAPI_TOT_INS"));
+    printf("> Total instructions: %ld\n", (long)pmc_read_by_index(0));
     printf("> Instructions per cycle: %2.3f\n",
-           (double)pmc_read("PAPI_TOT_INS") / (double)pmc_read("PAPI_TOT_CYC"));
+           (double)pmc_read_by_index(0) / (double)pmc_read_by_index(1));
   } else if (cur_evset == branch_evset) {
     printf("> Branch misprediction ratio: %2.3f%%\n",
-           100.0 * (double)pmc_read("PAPI_BR_MSP") /
-           (double)pmc_read("PAPI_BR_CN"));
+           100.0 * (double)pmc_read_by_index(1) /
+           (double)pmc_read_by_index(0));
   } else if (cur_evset != empty_evset) {
-    double ldst_insns = pmc_read("PAPI_LD_INS") + pmc_read("PAPI_SR_INS");
-    if (cur_evset == memory_evset || cur_evset == l1cache_evset)
-      printf("> L1 Data Cache miss ratio: %2.3f%%\n",
-             100.0 * pmc_read("PAPI_L1_DCM")/ldst_insns);
-    if (cur_evset == memory_evset || cur_evset == l2cache_evset)
-      printf("> L2 Data Cache miss ratio: %2.3f%%\n",
-             100.0 * pmc_read("PAPI_L2_DCM")/ldst_insns);
-    if (cur_evset == memory_evset || cur_evset == l3cache_evset)
-      printf("> L3 Cache miss ratio: %2.3f%%\n",
-             100.0 * pmc_read("PAPI_L3_TCM")/ldst_insns);
-    if (cur_evset == memory_evset || cur_evset == tlb_evset)
-      printf("> Data TLB miss ratio: %2.3f%%\n",
-             100.0 * pmc_read("PAPI_TLB_DM")/ldst_insns);
+    double ldst_insns = pmc_read_by_index(0) + pmc_read_by_index(1);
+    
+    if (ldst_insns == 0.0) {
+      ldst_insns = 1.0; // avoid division by zero if loads/stores not available
+    }
+
+    if (cur_evset == memory_evset || cur_evset == l1cache_evset) {
+      if (cur_evset[2].name != NULL) {
+        printf("> L1 Data Cache miss ratio: %2.3f%%\n",
+               100.0 * pmc_read_by_index(2) / ldst_insns);
+      } else {
+        printf("> L1 Data Cache miss ratio: [Not Available]\n");
+      }
+    }
+    if (cur_evset == memory_evset || cur_evset == l2cache_evset) {
+      int l2_idx = (cur_evset == memory_evset) ? 3 : 2;
+      if (cur_evset[l2_idx].name != NULL) {
+        printf("> L2 Data Cache miss ratio: %2.3f%%\n",
+               100.0 * pmc_read_by_index(l2_idx) / ldst_insns);
+      } else {
+        printf("> L2 Data Cache miss ratio: [Not Available]\n");
+      }
+    }
+    if (cur_evset == l3cache_evset) {
+      if (cur_evset[2].name != NULL) {
+        printf("> L3 Cache miss ratio: %2.3f%%\n",
+               100.0 * pmc_read_by_index(2) / ldst_insns);
+      } else {
+        printf("> L3 Cache miss ratio: [Not Available]\n");
+      }
+    }
+    if (cur_evset == tlb_evset) {
+      if (cur_evset[2].name != NULL) {
+        printf("> Data TLB miss ratio: %2.3f%%\n",
+               100.0 * pmc_read_by_index(2) / ldst_insns);
+      } else {
+        printf("> Data TLB miss ratio: [Not Available]\n");
+      }
+    }
   }
 #endif
 }
