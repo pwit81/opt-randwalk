@@ -6,7 +6,7 @@ jobs:
   build:
     name: Autograding
     runs-on: ubuntu-latest
-    container: cahirwpz/ii-ask-opt:latest
+    container: pwit81/ii-ask-opt:latest
     steps:
       - uses: actions/checkout@v2
       - uses: education/autograding@v1
